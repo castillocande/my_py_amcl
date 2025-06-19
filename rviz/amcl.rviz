@@ -1,0 +1,102 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /TF1
+        - /Map1
+        - /Scan1
+        - /Pose1
+        - /Particle Cloud1
+      Splitter Ratio: 0.5
+    Tree Height: 600
+  - Class: rviz_common/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
+      Draw Behind: false
+      Name: Map
+      Topic:
+        Value: /map
+      Use Topic Options: true
+      Reliability Policy: Reliable
+      Durability Policy: Transient Local
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Marker Scale: 1
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Tree:
+        map:
+          {}
+      Value: true
+    - Class: rviz_default_plugins/LaserScan
+      Name: Scan
+      Topic:
+        Value: /scan
+      Use Topic Options: true
+      Value: true
+      Size (Pixels): 3
+      Color: 255; 0; 0
+    - Class: rviz_default_plugins/PoseWithCovariance
+      Name: Pose
+      Topic:
+        Value: /amcl_pose
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Particle Cloud
+      Topic:
+        Value: /particle_cloud
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Name: Planned Path
+      Topic:
+        Value: /planned_path
+      Value: true
+      Line Style: Lines
+      Line Width: 0.1
+      Color: 25; 255; 0
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic:
+        Value: /initialpose
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Value: /goal_pose
+    - Class: rviz_default_plugins/PublishPoint
+      Single click: true
+      Topic:
+        Value: /clicked_point
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Target:
+        X: 0
+        Y: 0
+        Z: 0
+      Value: true 
