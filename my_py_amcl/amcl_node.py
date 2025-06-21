@@ -163,18 +163,13 @@ class AmclNode(Node):
 
     def initialize_particles_randomly(self):
         # TODO: Inizializar particulas aleatoriamente en todo el mapa
-        
-        
+        for i in range(self.num_particles):
+            x = np.random.uniform(0, self.map_data.info.height) #VER SI ESTA BIEN X-HEIGHT O ES CON WIDTH
+            y = np.random.uniform(0, self.map_data.info.width)
+            theta = np.random.uniform(0, 2*np.pi)
 
-
-
-
-
-
-
-
-
-
+            self.particles[i] = np.array([x, y, theta])
+   
         self.publish_particles()
 
     def timer_callback(self):
@@ -222,10 +217,67 @@ class AmclNode(Node):
 
     def motion_model(self, current_odom_tf):
         current_odom_pose = current_odom_tf.transform
-        
         # TODO: Implementar el modelo de movimiento para actualizar las particulas.
-        
-        self.last_odom_pose = current_odom_pose
+
+        """Process odometry using quaternion differencing."""
+        num_samples = 5000
+        x = current_odom_pose.pose.pose.position.x
+        y = current_odom_pose.pose.pose.position.y
+
+        q_w = current_odom_pose.pose.pose.orientation.w
+        q_x = current_odom_pose.pose.pose.orientation.x
+        q_y = current_odom_pose.pose.pose.orientation.y
+        q_z = current_odom_pose.pose.pose.orientation.z
+
+        current_rotation = R.from_quat([q_x, q_y, q_z, q_w])
+        theta = current_rotation.as_euler('xyz', degrees=False)[2] 
+
+        xt = np.array([x, y, theta])
+
+        if self.last_odom is not None:
+            prev_x, prev_y, prev_theta, prev_q = self.last_odom_pose
+            prev_rotation = R.from_quat(prev_q)
+
+            dx = x - prev_x
+            dy = y - prev_y
+            delta_t = np.sqrt(dx**2 + dy**2)
+
+            relative_rotation = prev_rotation.inv() * current_rotation
+            delta_r1 = relative_rotation.as_euler('xyz', degrees=False)[2]  # Extract yaw change
+            delta_r2 = 0  # Not needed, as we extract full rotation
+
+            for i, p in enumerate(self.particles):
+                # noise sigma for delta_rot1 
+                sigma_delta_rot1 = self.alphas[0] #ME FALTA USAR UNO DE LOS ALPHAS???
+                delta_rot1_noisy = delta_r1 + np.random.normal(0,sigma_delta_rot1, size=1)
+
+                # noise sigma for translation
+                sigma_translation = self.alphas[1]
+                translation_noisy = delta_t + np.random.normal(0,sigma_translation, size=1)
+
+                # noise sigma for delta_rot2
+                sigma_delta_rot2 = self.alphas[2]
+                delta_rot2_noisy = delta_r2 + np.random.normal(0,sigma_delta_rot2, size=1)
+
+                # Estimate of the new position of the robot
+                x_new = p[0] + translation_noisy * np.cos(p[2]+delta_rot1_noisy)
+                y_new = p[1] + translation_noisy * np.sin(p[2]+delta_rot1_noisy)
+
+                angle = p[2] + delta_rot1_noisy + delta_rot2_noisy
+                while(angle > np.pi):
+                    angle =  angle - 2*np.pi
+                
+                while (angle < - np.pi):
+                    angle = angle + 2*np.pi
+                theta_new =  angle
+            
+                self.particles[i] = np.array([x_new,y_new,theta_new])
+
+        else:
+            self.particles[i] = np.array([x, y, theta]) #VER, SE PODRIA CAMBIAR A QUE SEA COMO EN PARTE A, SUMARLE UN POCO DE RUIDO GAUSSIANO
+ 
+        self.last_odom_pose = (x, y, theta, [q_x, q_y, q_z, q_w])
+
 
     def measurement_model(self):
         map_res = self.map_data.info.resolution
@@ -240,12 +292,52 @@ class AmclNode(Node):
 
         # TODO: Implementar el modelo de medición para actualizar los pesos de las particulas por particula
 
+    
+        #normalize the weights  
+        S = sum(self.weights)      
+        w_norm=[self.weights[j]/S for j in range(self.num_particles)]
+
     def resample(self):
         # TODO: Implementar el resampleo de las particulas basado en los pesos.
-        pass
+        
+        #ASUMO QUE VIENEN NORMALIZADOS LOS PESOS
+        cdf_sum=0
+        p_cdf=[]
+
+        for k in range(self.num_particles):
+            cdf_sum = cdf_sum+self.weights[k]
+            p_cdf.append(cdf_sum)
+
+        step = 1.0/self.num_particles
+        seed = np.random.uniform(0, step)
+
+        p_sampled=[]
+        w_sampled=[]
+        last_index = 0
+        for h in range(self.num_particles):
+            while seed > p_cdf[last_index]:
+                last_index+=1
+            p_sampled.append(np.copy(self.particles[last_index])) #CAPAZ NECESITO DEEPCOPY
+            w_sampled.append(self.weights[last_index])
+            seed = seed+step
+        self.particles = np.array(p_sampled)
+        self.weights = np.array(w_sampled) #DONDE LOS NORMALIZO?
 
     def estimate_pose(self):
         # TODO: Implementar la estimación de pose a partir de las particulas y sus pesos.
+        #ASUMO QUE VIENEN NORMALIZADOS LOS PESOS
+        x_avg = 0
+        y_avg = 0
+        theta_avg = 0
+
+        for i,p in enumerate(self.particles):
+            weighted_p = p*self.weights[i]
+            x_avg += weighted_p[0]
+            y_avg += weighted_p[1]
+            theta_avg += weighted_p[2]
+
+        
+        pose = np.array([x_avg, y_avg, theta_avg])
         return pose
 
     def publish_pose(self, estimated_pose):
