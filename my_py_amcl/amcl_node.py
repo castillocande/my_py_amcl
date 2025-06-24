@@ -39,18 +39,18 @@ class AmclNode(Node):
 
         # --- Parameters to set ---
         # TODO: Setear valores default
-        self.declare_parameter('num_particles', completar)
-        self.declare_parameter('alpha1', completar)
-        self.declare_parameter('alpha2', completar)
-        self.declare_parameter('alpha3', completar)
-        self.declare_parameter('alpha4', completar)
-        self.declare_parameter('z_hit', completar)
-        self.declare_parameter('z_rand', completar)
-        self.declare_parameter('lookahead_distance', completar)
-        self.declare_parameter('linear_velocity', completar)
-        self.declare_parameter('goal_tolerance', completar)
-        self.declare_parameter('path_pruning_distance', completar)
-        self.declare_parameter('safety_margin_cells', completar)
+        self.declare_parameter('num_particles', 1000)
+        self.declare_parameter('alpha1', 0.1)
+        self.declare_parameter('alpha2', 0.1)
+        self.declare_parameter('alpha3', 0.2)
+        self.declare_parameter('alpha4', 0.2)
+        self.declare_parameter('z_hit', 0.9)
+        self.declare_parameter('z_rand', 0.1)
+        self.declare_parameter('lookahead_distance', 0.8)
+        self.declare_parameter('linear_velocity', 0.2)
+        self.declare_parameter('goal_tolerance', 0.2)
+        self.declare_parameter('path_pruning_distance', 0.3)
+        self.declare_parameter('safety_margin_cells', 2)
 
         
         
@@ -147,18 +147,22 @@ class AmclNode(Node):
         self.initial_pose_received = True
         self.last_odom_pose = None # Reset odom tracking
 
-    def initialize_particles(self, initial_pose):
+    def initialize_particles(self, initial_pose): # *********************
         # TODO: Inicializar particulas en base a la pose inicial con variaciones aleatorias
         # Deben ser la misma cantidad de particulas que self.num_particles
         # Deben tener un peso
+        # ----
+        x0 = initial_pose.position.x
+        y0 = initial_pose.position.y
+        orientation_q = initial_pose.orientation
+        theta0 = R.from_quat([orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]).as_euler('xyz')[2]
 
-
-
-
-
-
-
-
+        for i in range(self.num_particles):
+            x = x0 + np.random.normal(0, 0.2)
+            y = y0 + np.random.normal(0, 0.2)
+            theta = theta0 + np.random.normal(0, 0.1)
+            self.particles[i] = np.array([x, y, theta])
+        # ----
         self.publish_particles()
 
     def initialize_particles_randomly(self):
@@ -172,7 +176,7 @@ class AmclNode(Node):
    
         self.publish_particles()
 
-    def timer_callback(self):
+    def timer_callback(self): # *********************
         # TODO: Implementar maquina de estados para cada caso.
         # Debe haber estado para PLANNING, NAVIGATING y AVOIDING_OBSTACLE, pero pueden haber más estados si se desea.
         if not self.map_received:
@@ -193,20 +197,58 @@ class AmclNode(Node):
                 self.stop_robot()
             return
 
-        
-
-
-
-
-
-
-
         # TODO: Implementar codigo para publicar la pose estimada, las particulas, y la transformacion entre el mapa y la base del robot.
+        # ---- localización
+        self.motion_model(current_odom_tf) # actualizamos usando odometría
+        self.measurement_model() # actualizamos pesos de las partículas 
+        self.resample()
+        estimated_pose_array = self.estimate_pose()
 
+        estimated_pose = Pose()
+        estimated_pose.position.x = estimated_pose_array[0]
+        estimated_pose.position.y = estimated_pose_array[1]
+        q = R.from_euler('z', estimated_pose_array[2]).as_quat()
+        estimated_pose.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+        # ----
         self.publish_pose(estimated_pose)
         self.publish_particles()
         self.publish_transform(estimated_pose, current_odom_tf)
+        # ---- máquina de estados
+        if self.state == State.PLANNING:
+            if self.goal_pose is not None:
+                self.current_path = self.plan_path(estimated_pose.position, self.goal_pose.position)
+                if self.current_path:
+                    self.state = State.NAVIGATING
+                    self.get_logger().info("Path planned. State -> NAVIGATING")
+                else:
+                    self.get_logger().warn("Failed to plan path. Staying in PLANNING.")
+            else:
+                self.get_logger().warn("No goal pose. Staying in PLANNING.")
 
+        elif self.state == State.NAVIGATING:
+            if self.detect_obstacle():
+                self.get_logger().info("Obstacle detected. State -> AVOIDING_OBSTACLE")
+                self.state = State.AVOIDING_OBSTACLE
+                self.obstacle_avoidance_start_yaw = estimated_pose_array[2]
+                self.obstacle_avoidance_cumulative_angle = 0.0
+            elif self.reached_goal(estimated_pose.position, self.goal_pose.position):
+                self.get_logger().info("Goal reached! State -> IDLE")
+                self.state = State.IDLE
+                self.stop_robot()
+            else:
+                self.follow_path(estimated_pose)
+
+        elif self.state == State.AVOIDING_OBSTACLE:
+            # Giro evasivo en el lugar
+            self.avoid_obstacle(estimated_pose_array[2])
+            if self.obstacle_avoidance_cumulative_angle > np.pi / 2:
+                self.get_logger().info("Avoided obstacle. State -> PLANNING")
+                self.state = State.PLANNING
+                self.stop_robot()
+
+        elif self.state == State.IDLE:
+            self.stop_robot()  # Por si acaso se mueve
+        # ----
 
     def get_odom_transform(self):
         try:
@@ -220,7 +262,7 @@ class AmclNode(Node):
         # TODO: Implementar el modelo de movimiento para actualizar las particulas.
 
         """Process odometry using quaternion differencing."""
-        num_samples = 5000
+        num_samples = 5000 ## ?? 
         x = current_odom_pose.pose.pose.position.x
         y = current_odom_pose.pose.pose.position.y
 
@@ -279,20 +321,50 @@ class AmclNode(Node):
         self.last_odom_pose = (x, y, theta, [q_x, q_y, q_z, q_w])
 
 
-    def measurement_model(self):
+    def measurement_model(self): # *********************
         map_res = self.map_data.info.resolution
         map_origin = self.map_data.info.origin.position
         map_w = self.map_data.info.width
         map_h = self.map_data.info.height
         map_img = np.array(self.map_data.data).reshape((map_h, map_w))
 
-
-
-
-
         # TODO: Implementar el modelo de medición para actualizar los pesos de las particulas por particula
+        # ----
+        angles = np.linspace(self.latest_scan.angle_min, self.latest_scan.angle_max, len(self.latest_scan.ranges))
 
-    
+        for i, p in enumerate(self.particles):
+            x, y, theta = p
+            weight = 1.0
+
+            for j, angle in enumerate(angles[::15]):  # usamos solo 1 de cada 15 rayos para acelerar
+                scan_angle = theta + angle
+                measured_range = self.latest_scan.ranges[j*15]
+
+                if measured_range >= self.laser_max_range or np.isnan(measured_range):
+                    continue
+
+                # Punto esperado por el rayo desde la partícula
+                expected_x = x + measured_range * np.cos(scan_angle)
+                expected_y = y + measured_range * np.sin(scan_angle)
+
+                gx, gy = self.world_to_grid(expected_x, expected_y)
+
+                if 0 <= gx < map_w and 0 <= gy < map_h:
+                    cell = map_img[gy, gx]
+                    if cell > 50:  # umbral para considerar obstáculo
+                        prob_hit = self.z_hit
+                    else:
+                        prob_hit = 0.01  # poco probable si no hay obstáculo donde el LIDAR dice que sí
+                else:
+                    prob_hit = 0.01  # fuera del mapa
+
+                # Mezcla de modelos
+                prob = prob_hit + self.z_rand
+                weight *= prob  # producto de probabilidades
+
+            self.weights[i] = weight + 1e-300  # evitamos peso cero
+        # ----
+
         #normalize the weights  
         S = sum(self.weights)      
         w_norm=[self.weights[j]/S for j in range(self.num_particles)]
@@ -369,7 +441,7 @@ class AmclNode(Node):
             ma.markers.append(marker)
         self.particle_pub.publish(ma)
 
-    def publish_transform(self, estimated_pose, odom_tf):
+    def publish_transform(self, estimated_pose, odom_tf): # *********************
         map_to_base_mat = self.pose_to_matrix(estimated_pose)
         odom_to_base_mat = self.transform_to_matrix(odom_tf.transform)
         map_to_odom_mat = np.dot(map_to_base_mat, np.linalg.inv(odom_to_base_mat))
@@ -377,7 +449,18 @@ class AmclNode(Node):
         t = TransformStamped()
         
         # TODO: Completar el TransformStamped con la transformacion entre el mapa y la base del robot.
+        # ----
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = self.map_frame_id
+        t.child_frame_id = self.odom_frame_id
+        t.transform.translation.x = map_to_odom_mat[0, 3]
+        t.transform.translation.y = map_to_odom_mat[1, 3]
+        t.transform.translation.z = 0.0
 
+        rot = R.from_matrix(map_to_odom_mat[:3, :3])
+        q = rot.as_quat()
+        t.transform.rotation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+        # ----
         self.tf_broadcaster.sendTransform(t)
 
     def pose_to_matrix(self, pose):
@@ -417,8 +500,8 @@ class AmclNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = AmclNode()
-    rclpy.spin(node)
+    node = AmclNode() # nodo de Adaptive Monte Carlo Localization
+    rclpy.spin(node) 
     node.destroy_node()
     rclpy.shutdown()
 
