@@ -39,7 +39,7 @@ class AmclNode(Node):
         self.declare_parameter('goal_topic', '/goal_pose')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('obstacle_detection_distance', 0.3)
-        self.declare_parameter('obstacle_avoidance_turn_speed', 0.5)
+        self.declare_parameter('obstacle_avoidance_turn_speed', 1.5)
 
         # --- Parameters to set ---
         # TODO: Setear valores default
@@ -55,8 +55,10 @@ class AmclNode(Node):
         self.declare_parameter('goal_tolerance', 0.1)
         self.declare_parameter('path_pruning_distance', 0.3)
         self.declare_parameter('safety_margin_cells', 4)
-
-
+        self.front_angle_deg = 20
+        self.avoidance_turn_direction = None
+        self.obstacle_advancing = False
+        self.obstacle_advance_start_time = None
 
         self.num_particles = self.get_parameter('num_particles').value
         self.odom_frame_id = self.get_parameter('odom_frame_id').value
@@ -119,14 +121,20 @@ class AmclNode(Node):
         self.get_logger().info('MyPyAMCL node initialized.')
 
     def inflate_map(self):
-        kernel_size = self.safety_margin_cells
-        structuring_element = np.ones((2 * kernel_size + 1, 2 * kernel_size + 1), dtype=np.uint8)
+        """
+        Inflate the obstacle map to add a safety margin around occupied cells.
+        """
+        structuring_element = np.ones((2 * self.safety_margin_cells + 1, 2 * self.safety_margin_cells + 1), dtype=np.uint8)
         binary_map = (self.grid > 50).astype(np.uint8)  
 
-        inflated = grey_dilation(binary_map, footprint=structuring_element) #TODO: ver que hace esta funcion
+        inflated = grey_dilation(binary_map, footprint=structuring_element)
         self.inflated_grid = inflated
 
     def map_callback(self, msg):
+        """
+        Callback to handle the occupancy grid map when received.
+        Stores the map, reshapes it, and inflates it to account for safety margin.
+        """
         if not self.map_received:
             self.map_data = msg
             self.map_received = True
@@ -135,9 +143,16 @@ class AmclNode(Node):
             self.get_logger().info('Map and inflated map processed.')
 
     def scan_callback(self, msg):
+        """
+        Callback to store the most recent LIDAR scan.
+        """
         self.latest_scan = msg
 
     def goal_callback(self, msg):
+        """
+        Callback to receive and process a navigation goal.
+        Switches to planning state once the goal pose is set.
+        """
         if self.map_data is None:
             self.get_logger().warn("Goal received, but map is not available yet. Ignoring goal.")
             return
@@ -153,34 +168,45 @@ class AmclNode(Node):
         self.current_path = None
 
     def initial_pose_callback(self, msg):
+        """
+        Callback to set the initial pose if the frame is correct.
+        """
         if msg.header.frame_id != self.map_frame_id:
             self.get_logger().warn(f"Initial pose frame is '{msg.header.frame_id}' but expected '{self.map_frame_id}'. Ignoring.")
             return
         self.get_logger().info('Initial pose received.')
         self.initialize_particles(msg.pose.pose)
         self.initial_pose_received = True
-        self.last_odom_pose = None # Reset odom tracking
+        self.last_odom_pose = None 
 
-    def initialize_particles(self, initial_pose): # *********************
-        # TODO: Inicializar particulas en base a la pose inicial con variaciones aleatorias
-        # Deben ser la misma cantidad de particulas que self.num_particles
-        # Deben tener un peso
-        # ----
+    def initialize_particles(self, initial_pose, max_attempts=100):
+        """
+        Initialize particles for particle filter around a given initial pose with Gaussian noise.
+        """
         x0 = initial_pose.position.x
         y0 = initial_pose.position.y
         orientation_q = initial_pose.orientation
         theta0 = R.from_quat([orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]).as_euler('xyz')[2]
 
         for i in range(self.num_particles):
-            x = x0 + np.random.normal(0, 0.2)
-            y = y0 + np.random.normal(0, 0.2)
-            theta = theta0 + np.random.normal(0, 0.1)
+            for _ in range(max_attempts):
+                x = x0 + np.random.normal(0, 0.2)
+                y = y0 + np.random.normal(0, 0.2)
+                theta = self.normalize_angle(theta0 + np.random.normal(0, 0.1))
+
+                gx, gy = self.world_to_grid(x, y)
+
+                if 0 <= gx < self.map_data.info.width and 0 <= gy < self.map_data.info.height:
+                    if self.inflated_grid[gy, gx] == 0:
+                        break
             self.particles[i] = np.array([x, y, theta])
-        # ----
+  
         self.publish_particles()
 
     def initialize_particles_randomly(self):
-        # TODO: Inizializar particulas aleatoriamente en todo el mapa
+        """
+        Initialize particles randomly across free cells in the map.
+        """
         for i in range(self.num_particles):
             x, y, theta = self.sample_random_point()
 
@@ -188,11 +214,35 @@ class AmclNode(Node):
 
         self.publish_particles()
 
+    def sample_random_point(self, max_attempts=100):
+        """
+        Samples a random free point (x, y, theta) from the inflated map.
+        Returns world coordinates in a free cell, or (0.0, 0.0, 0.0) if none found.
+        """
+        for _ in range(max_attempts):
+            cell_x = np.random.randint(0, self.map_data.info.width)
+            cell_y = np.random.randint(0, self.map_data.info.height)
+
+            if self.inflated_grid[cell_y, cell_x] == 0:
+                world_x = cell_x * self.map_data.info.resolution + self.map_data.info.origin.position.x
+                world_y = cell_y * self.map_data.info.resolution + self.map_data.info.origin.position.y
+                theta = self.normalize_angle(np.random.uniform(0, 2 * np.pi))
+                return [world_x, world_y, theta]
+
+        self.get_logger().warn("Failed to sample free point after max_attempts.")
+        return [0.0, 0.0, 0.0]
+
     def normalize_weights(self):
+        """
+        Normalizes the particle weights to ensure they sum to 1.
+        """
         self.weights += 1e-300
         self.weights /= np.sum(self.weights)
 
     def stop_robot(self):
+        """
+        Publishes a zero Twist message to stop all robot motion.
+        """
         twist = Twist()
         twist.linear.x = 0.0
         twist.linear.y = 0.0
@@ -201,28 +251,6 @@ class AmclNode(Node):
         twist.angular.y = 0.0
         twist.angular.z = 0.0
         self.cmd_vel_pub.publish(twist)
-    
-    def sample_random_point(self, max_attempts=100):
-        """
-        Devuelve un punto aleatorio (x, y, theta) en el mapa que esté en una celda libre
-        según la inflated_grid. Coord. en el marco del mundo.
-        """
-        for _ in range(max_attempts):
-            # Generar coordenadas aleatorias en celdas del mapa
-            cell_x = np.random.randint(0, self.map_data.info.width)
-            cell_y = np.random.randint(0, self.map_data.info.height)
-
-            # Verificar si la celda está libre
-            if self.inflated_grid[cell_y, cell_x] == 0:
-                # Convertir a coordenadas del mundo
-                world_x = cell_x * self.map_data.info.resolution + self.map_data.info.origin.position.x
-                world_y = cell_y * self.map_data.info.resolution + self.map_data.info.origin.position.y
-                theta = np.random.uniform(0, 2 * np.pi)
-                return [world_x, world_y, theta]
-
-        # Si no encuentra un punto válido
-        self.get_logger().warn("Failed to sample free point after max_attempts.")
-        return [0.0, 0.0, 0.0]
 
     def timer_callback(self): # *********************
         # TODO: Implementar maquina de estados para cada caso.
@@ -250,15 +278,9 @@ class AmclNode(Node):
         self.motion_model(current_odom_tf) # actualizamos usando odometría
         self.measurement_model() # actualizamos pesos de las partículas
         self.normalize_weights()
+        estimated_pose, estimated_theta = self.estimate_pose()
         self.resample()
         self.normalize_weights()
-        
-        estimated_pose_array = self.estimate_pose()
-        estimated_pose = Pose()
-        estimated_pose.position.x = estimated_pose_array[0]
-        estimated_pose.position.y = estimated_pose_array[1]
-        q = R.from_euler('z', estimated_pose_array[2]).as_quat()
-        estimated_pose.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
 
         # ---- publica pose, particulas y transformacion
         self.publish_pose(estimated_pose)
@@ -282,18 +304,12 @@ class AmclNode(Node):
                 self.get_logger().warn("No goal pose. Staying in PLANNING.")
 
         elif self.state == State.NAVIGATING:
-            self.obstacle_avoidance_active = False
-
             if self.detect_obstacle():
                 self.stop_robot()
                 self.get_logger().info("Obstacle detected. State -> AVOIDING_OBSTACLE")
                 self.state = State.AVOIDING_OBSTACLE
-                self.obstacle_avoidance_start_yaw = estimated_pose_array[2] #angulo en el que estaba antes de empezar a evadir
-                #self.obstacle_avoidance_last_yaw = estimated_pose_array[2]
-                #self.obstacle_avoidance_cumulative_angle = 0.0 # acumula angulo girado, sirve para ver cuando ya vio mucho y no encontro salida ==>> cuando llega a 360 ya no hay salida
-                
-                self.obstacle_avoidance_active = True #ver cuando poner en true --> sacar de true cuando salga
-
+                self.obstacle_avoidance_last_yaw = estimated_theta
+                self.obstacle_avoidance_cumulative_angle = 0.0
 
             if self.reached_goal(estimated_pose.position):
                 self.get_logger().info("Goal reached! State -> IDLE")
@@ -303,16 +319,21 @@ class AmclNode(Node):
                 self.follow_path(estimated_pose)
 
         elif self.state == State.AVOIDING_OBSTACLE:
-            self.obstacle_avoidance_last_yaw = estimated_pose_array[2]
-            if self.avoid_obstacle():
-                self.get_logger().info("Avoided obstacle. State -> PLANNING")
-                self.state = State.PLANNING
+            if self.avoid_obstacle(estimated_theta):
+                self.stop_robot()
+                self.get_logger().info("Obstacle cleared. State -> NAVIGATING")
+                self.avoidance_turn_direction = None
+                self.obstacle_avoidance_cumulative_angle = 0.0
+                self.obstacle_avoidance_last_yaw = None
+                self.state = State.NAVIGATING
 
         elif self.state == State.IDLE:
             self.stop_robot()  
-        # ----
 
     def get_odom_transform(self):
+        """
+        Get the latest transform from odometry frame to robot base frame.
+        """
         try:
             return self.tf_buffer.lookup_transform(self.odom_frame_id, self.base_frame_id, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1))
         except Exception as e:
@@ -320,8 +341,11 @@ class AmclNode(Node):
             return None
 
     def motion_model(self, current_odom_tf):
+        """
+        Applies a probabilistic motion model to propagate each particle from the previous 
+        pose using the difference in odometry between the current and last one.
+        """
         current_odom_pose = current_odom_tf.transform
-        # TODO: Implementar el modelo de movimiento para actualizar las particulas.
 
         x = current_odom_pose.translation.x
         y = current_odom_pose.translation.y
@@ -333,7 +357,6 @@ class AmclNode(Node):
         current_rotation = R.from_quat([q_x, q_y, q_z, q_w])
         theta = current_rotation.as_euler('xyz', degrees=False)[2]
 
-
         if self.last_odom_pose is not None:
             prev_x, prev_y, prev_theta, prev_q = self.last_odom_pose
             prev_rotation = R.from_quat(prev_q)
@@ -343,43 +366,29 @@ class AmclNode(Node):
             delta_t = np.sqrt(dx**2 + dy**2)
 
             relative_rotation = prev_rotation.inv() * current_rotation
-            delta_r1 = relative_rotation.as_euler('xyz', degrees=False)[2]  # Extract yaw change
-            delta_r2 = 0  # Not needed, as we extract full rotation
+            delta_r1 = relative_rotation.as_euler('xyz', degrees=False)[2] 
+            delta_r2 = 0
 
             for i, p in enumerate(self.particles):
-                # noise sigma for delta_rot1
-                sigma_delta_rot1 = self.alphas[0] #ME FALTA USAR UNO DE LOS ALPHAS???
+                sigma_delta_rot1 = self.alphas[0]
                 delta_rot1_noisy = delta_r1 + np.random.normal(0,sigma_delta_rot1)
 
-                # noise sigma for translation
                 sigma_translation = self.alphas[2]
                 translation_noisy = delta_t + np.random.normal(0,sigma_translation)
 
-                # noise sigma for delta_rot2
                 sigma_delta_rot2 = self.alphas[1]
                 delta_rot2_noisy = delta_r2 + np.random.normal(0,sigma_delta_rot2)
 
-                # Estimate of the new position of the robot
                 x_new = p[0] + translation_noisy * np.cos(p[2]+delta_rot1_noisy)
                 y_new = p[1] + translation_noisy * np.sin(p[2]+delta_rot1_noisy)
 
-                angle = p[2] + delta_rot1_noisy + delta_rot2_noisy
-                while(angle > np.pi):
-                    angle =  angle - 2*np.pi
-                
-                while (angle < - np.pi):
-                    angle = angle + 2*np.pi
-                theta_new =  angle
-            
-                self.particles[i] = np.array([x_new,y_new,theta_new])
-
-        # else:
-        #     self.particles[i] = np.array([x, y, theta]) #VER, SE PODRIA CAMBIAR A QUE SEA COMO EN PARTE A, SUMARLE UN POCO DE RUIDO GAUSSIANO
+                angle = self.normalize_angle(p[2] + delta_rot1_noisy + delta_rot2_noisy)
+                self.particles[i] = np.array([x_new,y_new,angle])
 
         self.last_odom_pose = (x, y, theta, [q_x, q_y, q_z, q_w])
 
 
-    def measurement_model(self): # *********************
+    def measurement_model(self):
         map_res = self.map_data.info.resolution
         map_origin = self.map_data.info.origin.position
         map_w = self.map_data.info.width
@@ -401,27 +410,23 @@ class AmclNode(Node):
                 if measured_range >= self.laser_max_range or np.isnan(measured_range):
                     continue
 
-                # Punto esperado por el rayo desde la partícula
                 expected_x = x + measured_range * np.cos(scan_angle)
                 expected_y = y + measured_range * np.sin(scan_angle)
 
                 gx, gy = self.world_to_grid(expected_x, expected_y)
-
                 if 0 <= gx < map_w and 0 <= gy < map_h:
                     cell = map_img[gy, gx]
-                    if cell > 50:  # umbral para considerar obstáculo
+                    if cell > 0:
                         prob_hit = self.z_hit
                     else:
-                        prob_hit = 0.01  # poco probable si no hay obstáculo donde el LIDAR dice que sí
+                        prob_hit = 0.01 
                 else:
-                    prob_hit = 0.01  # fuera del mapa
+                    prob_hit = 0.01
 
-                # Mezcla de modelos
                 prob = prob_hit + self.z_rand
-                weight *= prob  # producto de probabilidades
+                weight *= prob 
 
-            self.weights[i] = weight + 1e-300  # evitamos peso cero
-        # ----
+            self.weights[i] = weight + 1e-300
 
     def resample(self):
         # TODO: Implementar el resampleo de las particulas basado en los pesos.
@@ -441,7 +446,7 @@ class AmclNode(Node):
         for h in range(self.num_particles):
             while last_index < self.num_particles - 1 and seed > p_cdf[last_index]:
                 last_index += 1
-            p_sampled.append(np.copy(self.particles[last_index])) #CAPAZ NECESITO DEEPCOPY
+            p_sampled.append(np.copy(self.particles[last_index]))
             w_sampled.append(self.weights[last_index])
             seed = seed+step
         self.particles = np.array(p_sampled)
@@ -461,9 +466,12 @@ class AmclNode(Node):
         cos_sum = np.sum(np.cos(self.particles[:, 2]) * self.weights)
         theta_avg = np.arctan2(sin_sum, cos_sum)
 
-
-        pose = np.array([x_avg, y_avg, theta_avg])
-        return pose
+        estimated_pose = Pose()
+        estimated_pose.position.x = x_avg
+        estimated_pose.position.y = y_avg
+        q = R.from_euler('z', theta_avg).as_quat()
+        estimated_pose.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+        return estimated_pose, theta_avg
 
     def collision_between(self, p1, p2):
         distance = np.linalg.norm(np.array(p2) - np.array(p1))
@@ -479,8 +487,6 @@ class AmclNode(Node):
 
             if 0 <= gx < self.map_data.info.width and 0 <= gy < self.map_data.info.height:
                 if self.inflated_grid[gy, gx] > 0:
-                    if self.obstacle_avoidance_active:
-                        return self.detect_obstacle()
                     return True
 
         return False
@@ -527,73 +533,6 @@ class AmclNode(Node):
                             
         return None
     
-    # def get_cost(self, tree, idx):
-    #     cost = 0
-    #     while tree[idx]["parent"] is not None:
-    #         parent_idx = tree[idx]["parent"]
-    #         cost += np.linalg.norm(tree[idx]["pose"] - tree[parent_idx]["pose"])
-    #         idx = parent_idx
-    #     return cost
-    
-    # def plan_path_rrt_star(self, pose, goal, max_iters=700, goal_sample_rate=0.1, step_size=0.4):
-    #     start = np.array([pose.x, pose.y])
-    #     goal = np.array([goal.x, goal.y])
-    #     tree = [{"pose": np.array(start), "parent": None}]
-
-    #     for _ in range(max_iters):
-    #         sample = goal if np.random.rand() < goal_sample_rate else np.array(self.sample_random_point()[:2])
-    #         dists = [np.linalg.norm(node["pose"] - sample) for node in tree]
-    #         nearest_index = int(np.argmin(dists))
-    #         nearest_pose = tree[nearest_index]["pose"]
-
-    #         direction = sample - nearest_pose
-    #         if np.linalg.norm(direction) == 0:
-    #             continue
-    #         direction /= np.linalg.norm(direction)
-    #         new_pose = nearest_pose + direction * step_size
-
-    #         if self.collision_between(nearest_pose, new_pose):
-    #             continue
-
-    #         # Radius para rewiring (r*)
-    #         r = min(1.0, step_size * np.sqrt(np.log(len(tree) + 1) / (len(tree) + 1)))
-    #         neighbors = [i for i, node in enumerate(tree) if np.linalg.norm(node["pose"] - new_pose) <= r]
-
-    #         # Mejor padre
-    #         best_parent = nearest_index
-    #         best_cost = self.get_cost(tree, nearest_index) + np.linalg.norm(nearest_pose - new_pose)
-    #         for i in neighbors:
-    #             neighbor_pose = tree[i]["pose"]
-    #             if not self.collision_between(neighbor_pose, new_pose):
-    #                 cost = self.get_cost(tree, i) + np.linalg.norm(neighbor_pose - new_pose)
-    #                 if cost < best_cost:
-    #                     best_cost = cost
-    #                     best_parent = i
-
-    #         # Agregar nuevo nodo
-    #         tree.append({"pose": new_pose, "parent": best_parent})
-    #         new_idx = len(tree) - 1
-
-    #         # Rewire vecinos
-    #         for i in neighbors:
-    #             neighbor_pose = tree[i]["pose"]
-    #             if not self.collision_between(new_pose, neighbor_pose):
-    #                 new_cost = best_cost + np.linalg.norm(new_pose - neighbor_pose)
-    #                 if new_cost < self.get_cost(tree, i):
-    #                     tree[i]["parent"] = new_idx
-
-    #         # Chequear si se puede conectar al goal
-    #         if np.linalg.norm(new_pose - goal) < step_size and not self.collision_between(new_pose, goal):
-    #             path = [goal.tolist()]
-    #             idx = new_idx
-    #             while idx is not None:
-    #                 path.insert(0, tree[idx]["pose"].tolist())
-    #                 idx = tree[idx]["parent"]
-    #             return path
-
-    #     return None
-
-    
     def smooth_path(self, max_segment_length=0.1):
         smoothed = [self.current_path[0]]
         i = 0
@@ -635,7 +574,7 @@ class AmclNode(Node):
             pose_stamped.pose.position.x = point[0]
             pose_stamped.pose.position.y = point[1]
             pose_stamped.pose.position.z = 0.0
-            pose_stamped.pose.orientation.w = 1.0  # sin rotación
+            pose_stamped.pose.orientation.w = 1.0
             path_msg.poses.append(pose_stamped)
 
         self.path_pub.publish(path_msg)
@@ -675,7 +614,6 @@ class AmclNode(Node):
 
         angle_to_target = math.atan2(local_y, local_x)
         if abs(angle_to_target) > np.deg2rad(90):
-            # demasiado desalineado, rotar en el lugar
             angular_velocity = 0.8 if angle_to_target > 0 else -0.8
             return 0.0, angular_velocity
 
@@ -689,11 +627,6 @@ class AmclNode(Node):
         linear_velocity = max(min_linear, max_linear / (1 + k * abs(curvature)))
 
         return linear_velocity, angular_velocity
-
-        # curvature = (2 * local_y) / (self.lookahead_distance ** 2)
-        # angular_velocity = self.linear_velocity * curvature
-
-        # return self.linear_velocity, angular_velocity
 
     def follow_path(self, pose):
         #TODO
@@ -722,15 +655,15 @@ class AmclNode(Node):
         twist.angular.z = angular_vel
         self.cmd_vel_pub.publish(twist)
     
-    def detect_obstacle(self, front_angle_rad=np.deg2rad(25), max_dist=0.3):
+    def detect_obstacle(self):
         #TODO
+        front_angle_rad = np.deg2rad(self.front_angle_deg)
         scan = self.latest_scan
         ranges = scan.ranges
         angle_min = scan.angle_min
         angle_increment = scan.angle_increment
 
-
-        center_index = len(ranges) // 2
+        center_index = int((0 - angle_min) / angle_increment)
         delta_index = int(front_angle_rad / angle_increment)
 
         start_index = max(0, center_index - delta_index)
@@ -739,65 +672,69 @@ class AmclNode(Node):
         for i in range(start_index, end_index):
             distance = ranges[i]
             if not math.isinf(distance) and not math.isnan(distance):
-                if distance < max_dist:
+                if distance < self.obstacle_detection_distance:
                     return True 
 
         return False 
     
-    def avoid_obstacle(self, clearance_deg=30, min_range_clear=0.5, angular_speed=0.5):
+    def turn_direction(self):
+        if self.avoidance_turn_direction is not None:
+            return self.avoidance_turn_direction
+        
+        ranges = np.array(self.latest_scan.ranges)
+        valid_ranges = np.where((ranges > 0.1) & (ranges < self.laser_max_range), ranges, np.nan)
+
+        fourth = len(valid_ranges) // 4
+        half = len(valid_ranges) // 2
+
+        right_indices = valid_ranges[fourth:half]     
+        left_indices  = valid_ranges[half:half+fourth]    
+
+        right_mean = np.nanmean(right_indices)
+        left_mean = np.nanmean(left_indices)
+
+        if np.isnan(left_mean): left_mean = 0
+        if np.isnan(right_mean): right_mean = 0
+
+        self.get_logger().info(f"left_mean: {left_mean:.2f}, right_mean: {right_mean:.2f}")
+        if left_mean > right_mean:
+            self.avoidance_turn_direction = 1
+            return 1 
+        else:
+            self.avoidance_turn_direction = -1
+            return -1  
+
+    def avoid_obstacle(self, current_yaw):
         #TODO
-        #no se bien que hacer aca, supongo que tiene que hacer un giro bruso para tener mas chances de poder evadir el obstaculo
-        scan = self.latest_scan
-        ranges = np.array(scan.ranges)
-        angle_min = scan.angle_min
-        angle_max = scan.angle_max
-        angle_increment = scan.angle_increment
-        num_rays = len(ranges)
+        if self.obstacle_advancing:
+            if (self.get_clock().now().nanoseconds / 1e9 ) - self.obstacle_advance_start_time  >= 1:
+                self.obstacle_advancing = False
+                self.obstacle_advance_start_time = None
+                return True
+            
+            if not self.detect_obstacle():
+                twist = Twist()
+                twist.linear.x = 0.1
+                self.cmd_vel_pub.publish(twist)   
+            else:
+                self.obstacle_advancing = False
+                self.obstacle_advance_start_time = None
+            return False
+      
+        delta_yaw = self.normalize_angle(current_yaw - self.obstacle_avoidance_last_yaw)
+        self.obstacle_avoidance_cumulative_angle += abs(delta_yaw)
+        self.obstacle_avoidance_last_yaw = current_yaw
 
-        clearance_rays = int(np.deg2rad(clearance_deg) / angle_increment)
-        valid_sector_indices = []
-
-        for i in range(num_rays - clearance_rays):
-            sector = ranges[i:i+clearance_rays]
-            if np.all(sector > min_range_clear):
-                valid_sector_indices.append(i + clearance_rays // 2)
-
-        if not valid_sector_indices:
-            self.get_logger().warn("No free direction found. Staying in place.")
+        if self.obstacle_avoidance_cumulative_angle >= np.deg2rad(45) and not self.detect_obstacle():
+            self.obstacle_advancing = True
+            self.obstacle_advance_start_time = (self.get_clock().now().nanoseconds / 1e9)
             return False
         
-        best_index = valid_sector_indices[0]
-        angle_to_turn = angle_min + best_index * angle_increment
-
-        # Obtenemos el ángulo actual del robot
-        pose = self.obstacle_avoidance_start_yaw  # o el que uses
-        q = pose.orientation
-        quat = [q.x, q.y, q.z, q.w]
-        yaw = R.from_quat(quat).as_euler('xyz')[2]
-        delta_theta = angle_to_turn - yaw
-        delta_theta = math.atan2(math.sin(delta_theta), math.cos(delta_theta))  # wrap [-pi, pi]
-
-        # Determinamos la dirección de giro
         twist = Twist()
-        twist.angular.z = angular_speed if delta_theta > 0 else -angular_speed
-        twist.linear.x = 0.0
-
-        # Publicamos la velocidad angular hasta que se alinee
-        duration = abs(delta_theta) / angular_speed
-        end_time = self.get_clock().now().to_msg().sec + duration
-
-        self.get_logger().info(f"Girando hacia ángulo libre: {np.rad2deg(angle_to_turn):.1f}°")
-
-        while self.get_clock().now().to_msg().sec < end_time:
-            self.cmd_vel_pub.publish(twist)
-
-        # Detener el giro
-        twist.angular.z = 0.0
+        twist.angular.z = self.obstacle_avoidance_turn_speed * self.turn_direction()
         self.cmd_vel_pub.publish(twist)
-        return True
-        
-
-
+        return False
+    
     def publish_pose(self, estimated_pose):
         p = PoseWithCovarianceStamped()
         p.header.stamp = self.get_clock().now().to_msg()
@@ -881,6 +818,13 @@ class AmclNode(Node):
         path_msg.header.stamp = self.get_clock().now().to_msg()
         path_msg.header.frame_id = self.map_frame_id
         self.path_pub.publish(path_msg)
+
+    def normalize_angle(self, angle):
+        while angle > np.pi:
+            angle -= 2 * np.pi
+        while angle < -np.pi:
+            angle += 2 * np.pi
+        return angle
 
 
 def main(args=None):
