@@ -294,7 +294,6 @@ class AmclNode(Node):
 
                 if self.current_path:
                     self.smooth_path()
-                    # self.split_sharp_turns()
                     self.publish_rrt_path()
                     self.state = State.NAVIGATING
                     self.get_logger().info("Path planned. State -> NAVIGATING")
@@ -515,8 +514,8 @@ class AmclNode(Node):
             direction = sample - tree[nearest_index]['pose']
             length = np.linalg.norm(direction)
             if length == 0:
-                continue  # Evitás avanzar hacia el mismo punto
-            direction = direction / length  # Normalizás
+                continue  
+            direction = direction / length  
             possible_new_pose = tree[nearest_index]['pose'] + direction * step_size
 
             if not self.collision_between(tree[nearest_index]['pose'], possible_new_pose):
@@ -544,7 +543,6 @@ class AmclNode(Node):
             i = j-1
             smoothed.append(self.current_path[i])
 
-        # Insertar puntos intermedios si la distancia entre dos puntos es muy grande
         refined = [smoothed[0]]
         for k in range(1, len(smoothed)):
             p1 = np.array(refined[-1])
