@@ -42,7 +42,6 @@ class AmclNode(Node):
         self.declare_parameter('obstacle_avoidance_turn_speed', 1.5)
 
         # --- Parameters to set ---
-        # TODO: Setear valores default
         self.declare_parameter('num_particles', 500)
         self.declare_parameter('alpha1', 0.1)
         self.declare_parameter('alpha2', 0.1)
@@ -252,9 +251,11 @@ class AmclNode(Node):
         twist.angular.z = 0.0
         self.cmd_vel_pub.publish(twist)
 
-    def timer_callback(self): # *********************
-        # TODO: Implementar maquina de estados para cada caso.
-        # Debe haber estado para PLANNING, NAVIGATING y AVOIDING_OBSTACLE, pero pueden haber más estados si se desea.
+    def timer_callback(self):
+        """
+        Main loop executed periodically to update localization and control the robot's behavior
+        based on a state machine. Handles localization, path planning, navigation, and obstacle avoidance.
+        """
         if not self.map_received:
             return
 
@@ -273,28 +274,25 @@ class AmclNode(Node):
                 self.stop_robot()
             return
 
-        # TODO: Implementar codigo para publicar la pose estimada, las particulas, y la transformacion entre el mapa y la base del robot.
-        # ---- localización
-        self.motion_model(current_odom_tf) # actualizamos usando odometría
-        self.measurement_model() # actualizamos pesos de las partículas
-        self.normalize_weights()
+
+        self.motion_model(current_odom_tf) 
+        self.measurement_model()
         estimated_pose, estimated_theta = self.estimate_pose()
         self.resample()
         self.normalize_weights()
 
-        # ---- publica pose, particulas y transformacion
         self.publish_pose(estimated_pose)
         self.publish_particles()
         self.publish_transform(estimated_pose, current_odom_tf)
         
-        # ---- máquina de estados
+        # ---- State machine ----
         if self.state == State.PLANNING:
             if self.goal_pose is not None:
                 self.current_path = self.plan_path_rrt(estimated_pose.position, self.goal_pose.position)
 
                 if self.current_path:
                     self.smooth_path()
-                    self.publish_rrt_path()
+                    self.publish_path()
                     self.state = State.NAVIGATING
                     self.get_logger().info("Path planned. State -> NAVIGATING")
                 else:
@@ -388,21 +386,21 @@ class AmclNode(Node):
 
 
     def measurement_model(self):
-        map_res = self.map_data.info.resolution
-        map_origin = self.map_data.info.origin.position
+        """
+        Uses a simplified beam-based measurement model to update the weight of each 
+        particle based on how well it explains the current LIDAR scan.
+        """
         map_w = self.map_data.info.width
         map_h = self.map_data.info.height
         map_img = np.array(self.map_data.data).reshape((map_h, map_w))
 
-        # TODO: Implementar el modelo de medición para actualizar los pesos de las particulas por particula
-        # ----
         angles = np.linspace(self.latest_scan.angle_min, self.latest_scan.angle_max, len(self.latest_scan.ranges))
 
         for i, p in enumerate(self.particles):
             x, y, theta = p
             weight = 1.0
 
-            for j, angle in enumerate(angles[::15]):  # usamos solo 1 de cada 15 rayos para acelerar
+            for j, angle in enumerate(angles[::15]):  # Use 1 out of every 15 beams to speed up the computation.
                 scan_angle = theta + angle
                 measured_range = self.latest_scan.ranges[j*15]
 
@@ -428,7 +426,10 @@ class AmclNode(Node):
             self.weights[i] = weight + 1e-300
 
     def resample(self):
-        # TODO: Implementar el resampleo de las particulas basado en los pesos.
+        """
+        Resamples the set of particles based on their weights using the 
+        stochastic universal resampling algorithm.
+        """
         cdf_sum=0
         p_cdf=[]
 
@@ -452,7 +453,9 @@ class AmclNode(Node):
         self.weights = np.array(w_sampled) 
 
     def estimate_pose(self):
-        # TODO: Implementar la estimación de pose a partir de las particulas y sus pesos.
+        """
+        Estimates the robot's pose as a weighted average of the particles.
+        """
         x_avg = 0
         y_avg = 0
 
@@ -473,6 +476,9 @@ class AmclNode(Node):
         return estimated_pose, theta_avg
 
     def collision_between(self, p1, p2):
+        """
+        Checks whether the straight line between two points intersects any obstacle in the occupancy grid.
+        """
         distance = np.linalg.norm(np.array(p2) - np.array(p1))
         if distance < self.map_data.info.resolution:
             return False
@@ -491,14 +497,10 @@ class AmclNode(Node):
         return False
 
     def plan_path_rrt(self, pose, goal, max_iters=1000, goal_sample_rate=0.1, step_size=0.4):
-        # TODO
-        #Hacer RRT
-        # Puede fallar si:
-        #   goal esta en una celda ocupada
-        #   robot en posicion fuera de mapa
-        #   no hay camino disponible
-        #   no converge el algoritmo
-
+        """
+        Plans a path from the start pose to the goal using the RRT algorithm.
+        Returns the path as a list of points if successful, or None otherwise.
+        """
         start = np.array([pose.x, pose.y])
         goal = np.array([goal.x, goal.y])
         tree = [{"pose": np.array(start), "parent": None}]
@@ -533,6 +535,10 @@ class AmclNode(Node):
         return None
     
     def smooth_path(self, max_segment_length=0.1):
+        """
+        Simplifies and refines the current path by removing unnecessary intermediate points
+        and inserting evenly spaced points between segments to ensure smooth navigation.
+        """
         smoothed = [self.current_path[0]]
         i = 0
         while i < len(self.current_path) - 1:
@@ -556,35 +562,23 @@ class AmclNode(Node):
                     intermediate = (1 - alpha) * p1 + alpha * p2
                     refined.append(intermediate.tolist())
 
-            #refined.append(p2.tolist())
         refined.append(smoothed[-1])
         self.current_path = refined
-    
-    def publish_rrt_path(self):
-        path_msg = Path()
-        path_msg.header.stamp = self.get_clock().now().to_msg()
-        path_msg.header.frame_id = self.map_frame_id
-
-        for point in self.current_path:
-            pose_stamped = PoseStamped()
-            pose_stamped.header.stamp = self.get_clock().now().to_msg()
-            pose_stamped.header.frame_id = self.map_frame_id
-            pose_stamped.pose.position.x = point[0]
-            pose_stamped.pose.position.y = point[1]
-            pose_stamped.pose.position.z = 0.0
-            pose_stamped.pose.orientation.w = 1.0
-            path_msg.poses.append(pose_stamped)
-
-        self.path_pub.publish(path_msg)
 
     def reached_goal(self, pose):
-        # TODO
+        """
+        Checks whether the robot has reached the goal position within a specified tolerance.
+        """   
         goal =  self.goal_pose.position
         pose_arr = np.array([pose.x, pose.y])
         goal_arr = np.array([goal.x, goal.y])
         return np.linalg.norm(pose_arr - goal_arr) < self.goal_tolerance
     
     def pure_pursuit(self, pose):
+        """
+        Implements the Pure Pursuit algorithm to compute motion commands based on the robot's current pose.
+        Returns linear and angular velocity.
+        """
         x = pose.position.x
         y = pose.position.y
         q = pose.orientation
@@ -601,14 +595,10 @@ class AmclNode(Node):
         if goal_point is None:
             return 0.0, 0.0 
 
-        # Transformar el punto al marco del robot
         dx = goal_point[0] - x
         dy = goal_point[1] - y
         local_x = math.cos(-theta) * dx - math.sin(-theta) * dy
         local_y = math.sin(-theta) * dx + math.cos(-theta) * dy
-
-        # if local_x <= 0: # Goal infront of robot.
-        #     return 0.0, 0.0
 
         angle_to_target = math.atan2(local_y, local_x)
         if abs(angle_to_target) > np.deg2rad(90):
@@ -618,16 +608,19 @@ class AmclNode(Node):
         curvature = (2 * local_y) / (self.lookahead_distance ** 2)
         angular_velocity = self.linear_velocity * curvature
 
-        # Reducir la velocidad lineal si la curvatura es alta
+        # Adjust linear velocity based on curvature.
         max_linear = self.linear_velocity
-        min_linear = 0.05  # velocidad mínima para mantener movimiento
-        k = 0.5  # constante que ajusta cuánto reduce la velocidad
+        min_linear = 0.05 
+        k = 0.5 
         linear_velocity = max(min_linear, max_linear / (1 + k * abs(curvature)))
-
         return linear_velocity, angular_velocity
 
     def follow_path(self, pose):
-        #TODO
+        """
+        Executes path following using the Pure Pursuit algorithm,
+        continuously prunes the path to remove points too close to the robot
+        and publishes velocity commands to move the robot.
+        """
         if not self.current_path or len(self.current_path) < 2:
             self.stop_robot()
             return
@@ -654,7 +647,9 @@ class AmclNode(Node):
         self.cmd_vel_pub.publish(twist)
     
     def detect_obstacle(self):
-        #TODO
+        """
+        Checks if there is an obstacle in front of the robot.
+        """
         front_angle_rad = np.deg2rad(self.front_angle_deg)
         scan = self.latest_scan
         ranges = scan.ranges
@@ -676,6 +671,10 @@ class AmclNode(Node):
         return False 
     
     def turn_direction(self):
+        """
+        Determines the preferred direction to turn to avoid an obstacle,
+        based on comparing the amount of free space on the left and right sides.
+        """
         if self.avoidance_turn_direction is not None:
             return self.avoidance_turn_direction
         
@@ -703,7 +702,9 @@ class AmclNode(Node):
             return -1  
 
     def avoid_obstacle(self, current_yaw):
-        #TODO
+        """
+        Handles the robot's behavior to avoid obstacles when one is detected.
+        """
         if self.obstacle_advancing:
             if (self.get_clock().now().nanoseconds / 1e9 ) - self.obstacle_advance_start_time  >= 1:
                 self.obstacle_advancing = False
@@ -734,6 +735,9 @@ class AmclNode(Node):
         return False
     
     def publish_pose(self, estimated_pose):
+        """
+        Publishes the estimated pose of the robot as a PoseWithCovarianceStamped message.
+        """
         p = PoseWithCovarianceStamped()
         p.header.stamp = self.get_clock().now().to_msg()
         p.header.frame_id = self.map_frame_id
@@ -741,6 +745,9 @@ class AmclNode(Node):
         self.pose_pub.publish(p)
 
     def publish_particles(self):
+        """
+        Publishes the current set of particles as a visualization marker array for RViz.
+        """
         ma = MarkerArray()
         for i, p in enumerate(self.particles):
             marker = Marker()
@@ -762,15 +769,15 @@ class AmclNode(Node):
             ma.markers.append(marker)
         self.particle_pub.publish(ma)
 
-    def publish_transform(self, estimated_pose, odom_tf): # *********************
+    def publish_transform(self, estimated_pose, odom_tf):
+        """
+        Publishes the transform between the map and odom frames based on the estimated pose.
+        """
         map_to_base_mat = self.pose_to_matrix(estimated_pose)
         odom_to_base_mat = self.transform_to_matrix(odom_tf.transform)
         map_to_odom_mat = np.dot(map_to_base_mat, np.linalg.inv(odom_to_base_mat))
 
         t = TransformStamped()
-
-        # TODO: Completar el TransformStamped con la transformacion entre el mapa y la base del robot.
-        # ----
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = self.map_frame_id
         t.child_frame_id = self.odom_frame_id
@@ -781,10 +788,13 @@ class AmclNode(Node):
         rot = R.from_matrix(map_to_odom_mat[:3, :3])
         q = rot.as_quat()
         t.transform.rotation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
-        # ----
+
         self.tf_broadcaster.sendTransform(t)
 
     def pose_to_matrix(self, pose):
+        """
+        Converts a Pose message into a 4x4 transformation matrix.
+        """
         q = pose.orientation
         r = R.from_quat([q.x, q.y, q.z, q.w])
         mat = np.eye(4)
@@ -793,6 +803,9 @@ class AmclNode(Node):
         return mat
 
     def transform_to_matrix(self, transform):
+        """
+        Converts a Transform message into a 4x4 transformation matrix.
+        """
         q = transform.rotation
         r = R.from_quat([q.x, q.y, q.z, q.w])
         mat = np.eye(4)
@@ -802,22 +815,46 @@ class AmclNode(Node):
         return mat
 
     def world_to_grid(self, wx, wy):
+        """
+        Converts world coordinates (meters) to grid map coordinates (cells).
+        """
         gx = int((wx - self.map_data.info.origin.position.x) / self.map_data.info.resolution)
         gy = int((wy - self.map_data.info.origin.position.y) / self.map_data.info.resolution)
         return (gx, gy)
 
     def grid_to_world(self, gx, gy):
+        """
+        Converts grid map coordinates (cells) to world coordinates (meters).
+        """
         wx = gx * self.map_data.info.resolution + self.map_data.info.origin.position.x
         wy = gy * self.map_data.info.resolution + self.map_data.info.origin.position.y
         return (wx, wy)
 
 
-    def publish_path(self, path_msg):
+    def publish_path(self):
+        """
+        Publishes the current path as a Path message.
+        """
+        path_msg = Path()
         path_msg.header.stamp = self.get_clock().now().to_msg()
         path_msg.header.frame_id = self.map_frame_id
+
+        for point in self.current_path:
+            pose_stamped = PoseStamped()
+            pose_stamped.header.stamp = self.get_clock().now().to_msg()
+            pose_stamped.header.frame_id = self.map_frame_id
+            pose_stamped.pose.position.x = point[0]
+            pose_stamped.pose.position.y = point[1]
+            pose_stamped.pose.position.z = 0.0
+            pose_stamped.pose.orientation.w = 1.0
+            path_msg.poses.append(pose_stamped)
+
         self.path_pub.publish(path_msg)
 
     def normalize_angle(self, angle):
+        """
+        Normalizes an angle to the range [-pi, pi].
+        """
         while angle > np.pi:
             angle -= 2 * np.pi
         while angle < -np.pi:
@@ -827,7 +864,7 @@ class AmclNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = AmclNode() # nodo de Adaptive Monte Carlo Localization
+    node = AmclNode() 
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
