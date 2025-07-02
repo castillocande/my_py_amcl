@@ -163,6 +163,7 @@ class AmclNode(Node):
         self.goal_pose = msg.pose
         self.get_logger().info(f"New goal received: ({self.goal_pose.position.x:.2f}, {self.goal_pose.position.y:.2f}). State -> PLANNING")
         self.initial_pose_sub
+        self.stop_robot()
         self.state = State.PLANNING
         self.current_path = None
 
@@ -277,6 +278,7 @@ class AmclNode(Node):
 
         self.motion_model(current_odom_tf) 
         self.measurement_model()
+        self.normalize_weights()
         estimated_pose, estimated_theta = self.estimate_pose()
         self.resample()
         self.normalize_weights()
@@ -496,7 +498,7 @@ class AmclNode(Node):
 
         return False
 
-    def plan_path_rrt(self, pose, goal, max_iters=1000, goal_sample_rate=0.1, step_size=0.4):
+    def plan_path_rrt(self, pose, goal, max_iters=2000, goal_sample_rate=0.1, step_size=0.4):
         """
         Plans a path from the start pose to the goal using the RRT algorithm.
         Returns the path as a list of points if successful, or None otherwise.
@@ -593,8 +595,8 @@ class AmclNode(Node):
                 break
 
         if goal_point is None:
-            return 0.0, 0.0 
-
+            goal_point = self.current_path[-1]
+            
         dx = goal_point[0] - x
         dy = goal_point[1] - y
         local_x = math.cos(-theta) * dx - math.sin(-theta) * dy
