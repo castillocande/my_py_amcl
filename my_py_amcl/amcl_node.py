@@ -18,6 +18,7 @@ import math
 
 
 class State(Enum):
+    """Defines the possible states of the robot."""
     IDLE = 0
     PLANNING = 1
     NAVIGATING = 2
@@ -25,6 +26,10 @@ class State(Enum):
 
 
 class AmclNode(Node):
+    """
+    ROS 2 node that implements Adaptive Monte Carlo Localization (AMCL)
+    combined with basic path planning, navigating and obstacle avoidance.
+    """
     def __init__(self):
         super().__init__('my_py_amcl')
 
